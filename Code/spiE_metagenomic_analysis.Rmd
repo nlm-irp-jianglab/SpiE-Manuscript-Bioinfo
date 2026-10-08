@@ -1,0 +1,176 @@
+---
+title: "SpiE Metagenomic Analysis"
+author: "Margaret Kato"
+date: "2026-08-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages
+```{r packages, echo=FALSE}
+#load libraries
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(ggtext)
+library(svglite)
+library(ggpubr)
+library(rstatix)
+library(purrr)
+library(writexl)
+```
+
+## Preparing Data
+```{r file_preparation, echo=TRUE}
+data <- read.csv("/Users/angela/Documents/hall_jiang_lab/SpiE/read_mapping/spiE_readmapping_supplemental.txt", sep="\t")
+
+#convert to presence/absence
+merged_data <- data %>%
+  filter(Cohort != "HT") %>%
+  filter(Total_Reads > 1e6) %>%
+  mutate(
+    spiE_present = if_else(CPM >= SPIE_THRESHOLD, TRUE, FALSE),
+    coprostanol_present = if_else(Coprostanol_AUC > METABOLITE_THRESHOLD, TRUE, FALSE),
+  )
+
+```
+
+# Visualization - Barchart
+```{r barchart, echo=TRUE, fig.width=15, fig.height=4}
+SPIE_COLOR <- "#83b379"
+
+#Figure 5a - bar chart
+spiE_counts <- data.frame(table(merged_data$coprostanol_present,merged_data$spiE_present,merged_data$Cohort))
+names(spiE_counts) <- c("coprostanol_present","spiE_present","Cohort","Count")
+
+#Fisher's exact test comparing spiE presence in coprostanol + and - samples
+fisher <- merged_data %>%
+  group_by(Cohort) %>%
+  summarise(
+    p_value = fisher.test(table(coprostanol_present, spiE_present))$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adjusted = p.adjust(p_value, method = "bonferroni"), #bonferroni correction
+    fisher_label = paste0("p = ", signif(p_adjusted, digits = 2)),
+    x = 1.5, #center x-axis placement between categories
+    y = 115 #place above highest bar
+  )
+
+#get total samples per group
+spiE_counts_total <- spiE_counts %>%
+  group_by(coprostanol_present, Cohort) %>%
+  summarise(
+    Total_samples = sum(Count)
+  )
+
+#calculate percent of samples per group with spiE present
+spiE_counts <- spiE_counts %>%
+  left_join(spiE_counts_total, by = c("coprostanol_present", "Cohort")) %>%
+  mutate(
+    Percent = (Count/Total_samples) * 100
+  )
+
+#set order of bars
+spiE_counts$spiE_present <- factor(spiE_counts$spiE_present, levels = c("FALSE", "TRUE")) #stacks
+spiE_counts$coprostanol_present <- factor(spiE_counts$coprostanol_present, levels = c("TRUE", "FALSE")) #x-axis
+
+#plot data 
+barchart_flipped <- ggplot(data = spiE_counts, 
+                   aes(x = factor(coprostanol_present), 
+                       y = Percent, 
+                       fill = spiE_present)) + 
+  geom_bar(stat = "identity", position = "stack", width = 0.85) + 
+  scale_y_continuous(
+    breaks = seq(0, 100, by = 20),
+    limits = c(0, 115)
+  ) +
+  facet_grid(~ Cohort) +
+  geom_text(aes(label = round(Percent, digits = 1)), position = position_stack(0.5)) + 
+  theme_classic() +
+  labs(
+    x = "Coprostanol Detected", 
+    y = "% Samples",
+    fill = "SpiE Present"
+  ) + 
+  theme(legend.position = "bottom") +
+  scale_fill_manual(values = c("#adadad", SPIE_COLOR)) + 
+  geom_text(
+    data = fisher, 
+    aes(x = x, y = y, label = fisher_label), 
+    inherit.aes = FALSE
+  )
+
+plot(barchart_flipped)
+
+```
+
+# Visualization - Boxplot
+```{r boxplot, echo=TRUE, fig.width=15, fig.height=4}
+#Figure 5b - box plot of coprostanol in spiE + and - samples
+#Mann-Whitney U/Wilcoxon rank sum test to compare coprostanol AUC in spiE + and - samples
+stat.test <- merged_data %>%
+  group_by(Cohort) %>%
+  wilcox_test(Coprostanol_AUC ~ spiE_present) %>%
+  ungroup() %>%  #ungroup so adjust_pvalue sees all tests at once
+  adjust_pvalue(method = "bonferroni") %>% #bonferroni correction
+  add_significance() %>%
+  mutate(
+    wilcox_label = paste0("p = ", signif(p.adj, digits = 2))
+  )
+
+#add chart spositioning to stat table
+stat.test <- stat.test %>% 
+  mutate(
+    x = 1.5, #center x-axis placement between categories
+    y = max(merged_data$coprostanol_o) * 1.2 #place above highest bar
+  )
+
+#summary of data
+boxplot_stats <- merged_data %>%
+  group_by(
+    Cohort, spiE_present
+  ) %>%
+  summarise(
+    n_samples = n(),
+    n_unique_samples = n_distinct(Run)
+  )
+
+#plot data
+boxplot <- ggplot(data=merged_data, aes(x=spiE_present, y=coprostanol_o)) + 
+  theme_classic() + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(aes(color = spiE_present), width = 0.2, size = 1.5, alpha = 0.8) +
+  facet_grid(~ Cohort) +
+  labs(x = "SpiE Detected", y = "Coprostanol Amount") +
+  theme(legend.position = "none") +
+  scale_color_manual(values=c(SPIE_COLOR, "#adadad")) +
+  geom_text(
+    data = stat.test, 
+    aes(x = x, y = y, label = wilcox_label), 
+    inherit.aes = FALSE
+  )
+
+plot(boxplot)
+```
+
+```{r scatterplot, echo=TRUE, fig.width=15, fig.height=4}
+#Supplemental figure - scatter plot with linear regression
+scatterplot <- ggplot(merged_data, aes(x=CPM, y=Coprostanol_AUC)) + #bonferroni correction added after initial plot generation by multiplying each p-value by 5
+  facet_grid(~ Cohort) +
+  geom_point() + 
+  theme_classic() + 
+  labs(x = "SpiE CPM", y = "Coprostanol Amount") +
+  geom_smooth(method = "lm", se = FALSE, fullrange = TRUE, color = SPIE_COLOR, linewidth = 0.5) +
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")), 
+           label.x = 0, label.y = max(merged_data$coprostanol_o) * 1.2)  
+
+
+
+plot(scatterplot)
+```
